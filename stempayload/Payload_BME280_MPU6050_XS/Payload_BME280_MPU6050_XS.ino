@@ -6,6 +6,9 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <MPU6050_tockn.h>
+#if !defined(ARDUINO_ARCH_MBED_RP2040) // && defined(ARDUINO_ARCH_RP2040)
+#include <EEPROM.h>
+#endif
 
 #if defined(ARDUINO_ARCH_MBED_RP2040) && defined(ARDUINO_ARCH_RP2040)  // if Arduino Mbed OS RP2040 Boards is used in Arduino IDE
 #include <TinyGPS++.h>
@@ -35,6 +38,9 @@ int greenLED = 9;
 int blueLED = 8;
 int Sensor1 = 0;
 float Sensor2 = 0;
+float temp;
+int calibration = 0;
+
 void ee_prom_word_write(int addr, int val);
 short ee_prom_word_read(int addr);
 int first_time = true;
@@ -65,12 +71,28 @@ float rest;
 
 char sensor_end_flag[] = "_END_FLAG_";
 char sensor_start_flag[] = "_START_FLAG_";
+char packet_end_flag[] = "_END_PACKET_";
+char packet_start_flag[] = "_START_PACKET_";
 bool show_gps = true;  // set to false to not see all  messages
 float flon = 0.0, flat = 0.0, flalt = 0.0;
 void get_gps();
 
 extern void payload_setup();  // sensor extension setup function defined in payload_extension.cpp
 extern void payload_loop();  // sensor extension read function defined in payload_extension.cpp
+
+// Methods for the science payload interface
+extern void initialize_interface();
+extern void interface_send(byte* packet, int length);
+extern void interface_read();
+extern byte hex2byte(char upper, char lower);
+extern void command_test(byte apid, byte* data, byte length);
+void payload_cmd_test();
+
+// enable and tracking for payload interface test cycle
+bool payload_test_enable = 1;
+bool payload_read_enable = 0;
+bool log_loop_enable = 1;
+unsigned long last_test_sclk = 0;
 
 void setup() {
 	
@@ -84,7 +106,11 @@ void setup() {
 #endif 
 	
   Serial1.begin(115200);  // for communication with Pi Zero 
-
+	
+#if !defined(ARDUINO_ARCH_MBED_RP2040) && defined(ARDUINO_ARCH_RP2040)  // if Raspberry Pi RP2040 Boards in Arduino IDE	
+  EEPROM.begin(512);
+#endif
+	
   delay(2000);
 	
 #if defined (ARDUINO_ARCH_MBED_RP2040) && (ARDUINO_ARCH_RP2040)
@@ -151,26 +177,70 @@ void setup() {
     Serial.println(zOffset, DEC);
  
     mpu6050.setGyroOffsets(xOffset, yOffset, zOffset);
+
+    Serial.println("\nTemperature calibration data from EEPROM\n");
+ 
+    T1 = ((float)eeprom_word_read(4)) / 10.0;
+    R1 = ((float)eeprom_word_read(5));
+    T2 = ((float)eeprom_word_read(6)) / 10.0;
+    R2 = ((float)eeprom_word_read(7));
+ 
+    Serial.println(T1, DEC);
+    Serial.println(R1, DEC);
+    Serial.println(" ");	  
+    Serial.println(T2, DEC);
+    Serial.println(R2, DEC);
+    Serial.println(" ");	  
+	  
   }
   else
   {
     Serial.println("Calculating gyro offsets\n");
-    mpu6050.calcGyroOffsets(true);	  
-#if !defined (ARDUINO_ARCH_RP2040)
+    mpu6050.calcGyroOffsets(true);
+	  
+#if !defined(ARDUINO_ARCH_MBED_RP2040) // && defined(ARDUINO_ARCH_RP2040)  // if Raspberry Pi RP2040 Boards is used in Arduino IDE
     Serial.println("Storing gyro offsets in EEPROM\n");
  
     eeprom_word_write(0, 0xA07);
     eeprom_word_write(1, (int)(mpu6050.getGyroXoffset() * 100.0) + 0.5);
     eeprom_word_write(2, (int)(mpu6050.getGyroYoffset() * 100.0) + 0.5);
-    eeprom_word_write(3, (int)(mpu6050.getGyroZoffset() * 100.0) + 0.5);
+    eeprom_word_write(3, (int)(mpu6050.getGyroZoffset() * 100.0) + 0.5);  
  
     Serial.println(eeprom_word_read(0), HEX);
     Serial.println(((float)eeprom_word_read(1)) / 100.0, DEC);
     Serial.println(((float)eeprom_word_read(2)) / 100.0, DEC);
     Serial.println(((float)eeprom_word_read(3)) / 100.0, DEC);
+
+   Serial.println("\nStoring temperature calibration data in EEPROM\n");
+
+   eeprom_word_write(4, (int)(T1 * 10.0) + 0.5);
+   eeprom_word_write(5, (int) R1);	  
+   eeprom_word_write(6, (int)(T2 * 10.0) + 0.5);
+   eeprom_word_write(7, (int) R2);
+	  
+   T1 = ((float)eeprom_word_read(4)) / 10.0;
+   R1 = ((float)eeprom_word_read(5));
+   T2 = ((float)eeprom_word_read(6)) / 10.0;
+   R2 = ((float)eeprom_word_read(7));
+
+    Serial.println(T1, DEC);
+    Serial.println(R1, DEC);
+    Serial.println(" ");
+    Serial.println(T2, DEC);
+    Serial.println(R2, DEC);
+    Serial.println(" ");
+	  
+#if !defined(ARDUINO_ARCH_MBED_RP2040) && defined(ARDUINO_ARCH_RP2040)  // if Raspberry Pi RP2040 Boards is used in Arduino IDE	  
+   if (EEPROM.commit()) {
+      Serial.println("EEPROM successfully committed\n");
+   } else {
+      Serial.println("ERROR! EEPROM commit failed\n");
+   }
+#endif	  
 #endif	  
   }
   payload_setup();  // sensor extension setup function defined in payload_extension.cpp   
+  initialize_interface();
 }
  
 void loop() {
@@ -200,20 +270,26 @@ void loop() {
         Serial1.print(" ");
         Serial1.print(bme.readHumidity());
 
-        Serial.print("OK BME280 ");
-        Serial.print(bme.readTemperature());
-        Serial.print(" ");
-        Serial.print(bme.readPressure() / 100.0F);
-        Serial.print(" ");
-        Serial.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
-        Serial.print(" ");
-        Serial.print(bme.readHumidity());
+        if (log_loop_enable) {
+          Serial.print("OK BME280 ");
+	        temp = bme.readTemperature();       
+          Serial.print(temp);
+          Serial.print(" ");
+          Serial.print(bme.readPressure() / 100.0F);
+          Serial.print(" ");
+          Serial.print(bme.readAltitude(SEALEVELPRESSURE_HPA));
+          Serial.print(" ");
+          Serial.print(bme.readHumidity());
+        }
+        
       } else
       {
         Serial1.print(sensor_start_flag);
         Serial1.print("OK BME280 0.0 0.0 0.0 0.0");
 
-        Serial.print("OK BME280 0.0 0.0 0.0 0.0");
+        if (log_loop_enable) {
+          Serial.print("OK BME280 0.0 0.0 0.0 0.0");
+        }
       }
       mpu6050.update();
  
@@ -231,19 +307,21 @@ void loop() {
       Serial1.print(" ");
       Serial1.print(mpu6050.getAccZ());   
 
-      Serial.print(" MPU6050 ");
-      Serial.print(mpu6050.getGyroX());
-      Serial.print(" ");
-      Serial.print(mpu6050.getGyroY());
-      Serial.print(" ");
-      Serial.print(mpu6050.getGyroZ());
+      if (log_loop_enable) {
+        Serial.print(" MPU6050 ");
+        Serial.print(mpu6050.getGyroX());
+        Serial.print(" ");
+        Serial.print(mpu6050.getGyroY());
+        Serial.print(" ");
+        Serial.print(mpu6050.getGyroZ());
  
-      Serial.print(" ");
-      Serial.print(mpu6050.getAccX());   
-      Serial.print(" ");
-      Serial.print(mpu6050.getAccY());   
-      Serial.print(" ");
-      Serial.print(mpu6050.getAccZ());  
+        Serial.print(" ");
+        Serial.print(mpu6050.getAccX());   
+        Serial.print(" ");
+        Serial.print(mpu6050.getAccY());   
+        Serial.print(" ");
+        Serial.print(mpu6050.getAccZ()); 
+      } 
      
       sensorValue = read_analog();
      
@@ -264,19 +342,20 @@ void loop() {
 	    
 //    Serial1.print(" ");
 //    Serial1.println(Sensor2);              
-
-    Serial.print(" GPS ");
-    Serial.print(flat,4);   
-    Serial.print(" ");
-    Serial.print(flon,4);              
-    Serial.print(" ");
-    Serial.print(flalt,2);  	    
+    if (log_loop_enable) {
+      Serial.print(" GPS ");
+      Serial.print(flat,4);   
+      Serial.print(" ");
+      Serial.print(flon,4);              
+      Serial.print(" ");
+      Serial.print(flalt,2);  	    
 
 //    Serial.print(" GPS 0 0 0 TMP ");
-    Serial.print(" TMP ");	    
-    Serial.print(Temp);   
+      Serial.print(" TMP ");	    
+      Serial.print(Temp);   
 //    Serial.print(" ");
-//    Serial.println(Sensor2);     
+//    Serial.println(Sensor2); 
+    }    
      
     float rotation = sqrt(mpu6050.getGyroX()*mpu6050.getGyroX() + mpu6050.getGyroY()*mpu6050.getGyroY() + mpu6050.getGyroZ()*mpu6050.getGyroZ()); 
     float acceleration = sqrt(mpu6050.getAccX()*mpu6050.getAccX() + mpu6050.getAccY()*mpu6050.getAccY() + mpu6050.getAccZ()*mpu6050.getAccZ()); 
@@ -300,11 +379,29 @@ void loop() {
         led_set(blueLED, LOW);
     }
 
-    payload_loop(); // sensor extension read function defined in payload_extension.cpp	  
+    if (log_loop_enable) {
+      Serial.println("");
+    }
+  
+
+    payload_loop(); // sensor extension read function defined in payload_extension.cpp
+
+    if (payload_test_enable) {
+      payload_cmd_test(); // run the payload test if it is enabled
+    }
+    
+
+    if (payload_read_enable) {
+      interface_read(); // Receive packets from each payload
+    }
+    
+
 
 //    Serial1.println(" ");
     Serial1.println(sensor_end_flag);	  
-    Serial.println(" ");
+    if (log_loop_enable) {
+      Serial.println(" ");
+    }
 	  
   }
 
@@ -314,25 +411,134 @@ void loop() {
 //    Serial.println(result);
 //    Serial.println("OK");
 //    Serial.println(counter++); 
-#if !defined (ARDUINO_ARCH_RP2040)
-  if (result == 'R') {	  
-      Serial1.println("OK");
-      delay(100);
+//#if !defined (ARDUINO_ARCH_RP2040)
+  if (result == 'R' || result == 'r') {	  
+//      Serial1.println("OK");
+//      delay(100);
+      Serial.println("Resetting\n");	  
       first_read = true;
       setup();
     }
-  else if (result == 'C') {
-      Serial.println("Clearing stored gyro offsets in EEPROM\n");
+  else if (result == 'D' || result == 'd') {
+    Serial.println("\nCurrent temperature calibration data\n");	  
+    Serial.println(T1, DEC);
+    Serial.println(R1, DEC);
+    Serial.println(" ");	  
+    Serial.println(T2, DEC);
+    Serial.println(R2, DEC);
+	  
+    Serial.println("\nCurrent raw temperature reading\n");	  
+    Serial.println(sensorValue, DEC);	
+    Serial.println(" ");
+  }
+  else if (result == 'C' || result == 'c') {
+      Serial.println("\nClearing stored gyro offsets in EEPROM\n");
       eeprom_word_write(0, 0x00);
+#if !defined(ARDUINO_ARCH_MBED_RP2040) && defined(ARDUINO_ARCH_RP2040)  // if Raspberry Pi RP2040 Boards is used in Arduino IDE
+	  
+      if (EEPROM.commit()) {
+      	Serial.println("EEPROM successfully committed\n");
+      } else {
+        Serial.println("ERROR! EEPROM commit failed\n");
+      }	
+#endif	  
       first_time = true;
       setup();
-    }  
-#endif	  	
+    }
+  else if (result == 'S' || result == 's') {
+    Serial.print("\nStoring temperature calibration data point "); //  in EEPROM\n");
+    Serial.print(calibration + 1);	  
+    Serial.print(" in EEPROM\n");
+	    
+    Serial.println(temp);
+    Serial.println(sensorValue);
+    Serial.println(" ");	  
+	  
+    eeprom_word_write(calibration * 2 + 4 , (int)(temp * 10.0) + 0.5);
+    eeprom_word_write(calibration * 2 + 5, sensorValue);
+
+    if (calibration == 0) {
+	    T1 = temp;
+	    R1 = sensorValue;
+	    calibration = 1;
+    } else {
+	    T2 = temp;
+	    R2 = sensorValue;
+	    calibration = 0;
+    } 	    
+
+//    calibration = (calibration + 1) % 2;
+//    Serial.println(calibration + 1);	  
+	  
+#if !defined(ARDUINO_ARCH_MBED_RP2040) && defined(ARDUINO_ARCH_RP2040)  // if Raspberry Pi RP2040 Boards is used in Arduino IDE
+	  
+    if (EEPROM.commit()) {
+      Serial.println("EEPROM successfully committed\n");
+    } else {
+      Serial.println("ERROR! EEPROM commit failed\n");
+    }
+#endif
+	  
+  }
+
+  else if (result == 'P') {
+    payload_test_enable = !payload_test_enable;
+  }
+
+  else if (result == 'p') {
+    payload_cmd_test();
+  }
+
+  else if (result == 'h') {
+    interface_read();
+  }
+
+  else if (result == 'H') {
+    payload_read_enable = !payload_read_enable;
+  }
+
+  else if (result == 'l' || result == 'L') {
+    log_loop_enable = !log_loop_enable;
+  }
+
+  // If serial input starts with "0x" convert it into a manual payload command packet for distribution
+  else if (result == '0') {
+    if (Serial.available() && Serial.read() == 'x') {
+
+      // Read 4 bytes for the APID and data length
+      byte header[4];
+      if (Serial.available() >=4) {
+        Serial.readBytes(header, 4);
+      }
+
+      // Parse the APID and data length
+      byte apid = hex2byte(header[0], header[1]);
+      byte length = hex2byte(header[2], header[3]);
+      
+      // Read in the data hex string
+      byte charData[length*2];
+
+      if (Serial.available() >= length*2) {
+        Serial.readBytes(charData, length*2);
+        // Parse the data as a hex string
+        byte data[length];
+        for (int i=0; i<length; i++) {
+          data[i] = hex2byte(charData[i*2], charData[i*2+1]);
+        }
+
+        Serial.println("Dispatching manual command");
+        command_test(apid, data, length);
+      }
+    }
+  }  
+//#endif	  	
   }  
 	  
 #if defined (ARDUINO_ARCH_MBED_RP2040) || (ARDUINO_ARCH_RP2040)
-  Serial.print("Squelch: ");	
-  Serial.println(digitalRead(15));
+  if (log_loop_enable) {
+    Serial.print("Squelch: ");
+    Serial.println(digitalRead(15));
+  }
 
   get_gps();
 #else
@@ -343,7 +549,7 @@ void loop() {
  
 void eeprom_word_write(int addr, int val)
 {
-#if !defined(ARDUINO_ARCH_MBED_RP2040) && !defined(ARDUINO_ARCH_RP2040)	
+#if !defined(ARDUINO_ARCH_MBED_RP2040) // && defined(ARDUINO_ARCH_RP2040)  // if Raspberry Pi RP2040 Boards is used in Arduino IDE
   EEPROM.write(addr * 2, lowByte(val));
   EEPROM.write(addr * 2 + 1, highByte(val));
 #endif	
@@ -352,7 +558,7 @@ void eeprom_word_write(int addr, int val)
 short eeprom_word_read(int addr)
 {
   int result = 0;	
-#if !defined(ARDUINO_ARCH_MBED_RP2040) && !defined(ARDUINO_ARCH_RP2040)	
+#if !defined(ARDUINO_ARCH_MBED_RP2040) // && defined(ARDUINO_ARCH_RP2040)  // if Raspberry Pi RP2040 Boards is used in Arduino IDE
   result = ((EEPROM.read(addr * 2 + 1) << 8) | EEPROM.read(addr * 2));
 #endif
   return result;	
@@ -546,3 +752,44 @@ void get_gps() {
     ;
 }
 #endif	
+
+std::vector<std::vector<byte>> test_cmds = {
+  // {0x10, 0x02, 0xc0, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0x00},
+  {0x10, 0x12, 0xc0, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0x00},
+  {0x10, 0x42, 0xc0, 0x00, 0x00, 0x03, 0xFF, 0xFF, 0x00},
+  // {0x10, 0x02, 0xc0, 0x00, 0x00, 0x03, 0xFF, 0x00, 0xFF},
+  {0x10, 0x12, 0xc0, 0x00, 0x00, 0x03, 0xFF, 0x00, 0xFF},
+  {0x10, 0x42, 0xc0, 0x00, 0x00, 0x03, 0xFF, 0x00, 0xFF},
+  // {0x10, 0x02, 0xc0, 0x00, 0x00, 0x03, 0x00, 0xFF, 0xFF},
+  {0x10, 0x12, 0xc0, 0x00, 0x00, 0x03, 0x00, 0xFF, 0xFF},
+  {0x10, 0x42, 0xc0, 0x00, 0x00, 0x03, 0x00, 0xFF, 0xFF},
+};
+
+int next_cmd = 0;
+
+// Utility function to cycle through a set of defined outgoing commands to test the payload interface
+void payload_cmd_test() {
+  
+  // If the test loop isn't currently enabled, or it has been less than a second, do nothing
+  if ((millis() - last_test_sclk) < 500) {
+    return;
+  }
+  last_test_sclk = millis();
+
+  // Reset back to the start if we've reached the end of the command list
+  if (next_cmd >= test_cmds.size()) {
+    next_cmd = 0;
+  }
+
+  // Convert the next command to an array
+  byte* packet = new byte[test_cmds[next_cmd].size()];
+
+  std::copy(test_cmds[next_cmd].begin(), test_cmds[next_cmd].end(), packet);
+
+  interface_send(packet, test_cmds[next_cmd].size());
+
+  delete[] packet;
+
+  next_cmd++;
+
+}
